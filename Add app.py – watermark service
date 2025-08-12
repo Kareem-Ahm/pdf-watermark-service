@@ -1,0 +1,116 @@
+# app.py
+import os
+import io
+import datetime
+from flask import Flask, request, jsonify
+from dotenv import load_dotenv
+from reportlab.pdfgen import canvas
+import pikepdf
+import boto3
+import smtplib
+from email.message import EmailMessage
+
+load_dotenv()
+
+S3_BUCKET = os.getenv("S3_BUCKET")
+S3_REGION = os.getenv("S3_REGION", "us-east-1")
+AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY")
+AWS_SECRET_KEY = os.getenv("AWS_SECRET_KEY")
+
+FROM_EMAIL = os.getenv("FROM_EMAIL")
+EMAIL_SMTP_HOST = os.getenv("EMAIL_SMTP_HOST")
+EMAIL_SMTP_PORT = int(os.getenv("EMAIL_SMTP_PORT", "587"))
+EMAIL_SMTP_USER = os.getenv("EMAIL_SMTP_USER")
+EMAIL_SMTP_PASS = os.getenv("EMAIL_SMTP_PASS")
+
+BASE_PDF_PATH = os.getenv("BASE_PDF_PATH", "program_base.pdf")
+PRESIGNED_EXPIRES = int(os.getenv("PRESIGNED_EXPIRES", "86400"))  # seconds
+
+s3 = boto3.client(
+    "s3",
+    region_name=S3_REGION,
+    aws_access_key_id=AWS_ACCESS_KEY,
+    aws_secret_access_key=AWS_SECRET_KEY,
+)
+
+app = Flask(__name__)
+
+def create_watermark_pdf(text, pagesize):
+    packet = io.BytesIO()
+    c = canvas.Canvas(packet, pagesize=pagesize)
+    width, height = pagesize
+    c.saveState()
+    c.translate(width/2, height/2)
+    c.rotate(45)
+    c.setFont("Helvetica", 36)
+    try:
+        c.setFillAlpha(0.12)
+    except Exception:
+        pass
+    c.drawCentredString(0, 0, text)
+    c.restoreState()
+    c.save()
+    packet.seek(0)
+    return packet
+
+def stamp_pdf(original_pdf_path, watermark_text):
+    with pikepdf.Pdf.open(original_pdf_path) as orig_pdf:
+        first_page = orig_pdf.pages[0]
+        pagesize = (float(first_page.MediaBox[2]), float(first_page.MediaBox[3]))
+        wm_stream = create_watermark_pdf(watermark_text, pagesize)
+        wm_pdf = pikepdf.Pdf.open(wm_stream)
+        for page in orig_pdf.pages:
+            page.add_overlay(wm_pdf.pages[0])
+        out_buf = io.BytesIO()
+        orig_pdf.save(out_buf)
+        out_buf.seek(0)
+        return out_buf
+
+def upload_to_s3(file_bytes_io, key):
+    s3.upload_fileobj(file_bytes_io, S3_BUCKET, key, ExtraArgs={"ContentType": "application/pdf"})
+    url = s3.generate_presigned_url('get_object', Params={'Bucket': S3_BUCKET, 'Key': key}, ExpiresIn=PRESIGNED_EXPIRES)
+    return url
+
+def send_email(to_email, subject, body_text):
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = FROM_EMAIL
+    msg["To"] = to_email
+    msg.set_content(body_text)
+    with smtplib.SMTP(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT) as smtp:
+        smtp.starttls()
+        smtp.login(EMAIL_SMTP_USER, EMAIL_SMTP_PASS)
+        smtp.send_message(msg)
+
+@app.route("/webhook/payhip", methods=["POST"])
+def payhip_webhook():
+    try:
+        payload = request.get_json()
+        buyer_name = payload.get("buyer_name") or payload.get("name") or payload.get("customer_name") or payload.get("first_name")
+        buyer_email = payload.get("buyer_email") or payload.get("email") or payload.get("customer_email")
+        order_id = payload.get("order_id") or payload.get("id") or payload.get("purchase_id")
+        product_title = payload.get("product_title") or payload.get("product") or "Purchased Program"
+
+        if not buyer_email:
+            return jsonify({"error": "email not found in payload"}), 400
+
+        dt = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+        watermark = f"This copy belongs to: {buyer_name or 'Customer'} — {buyer_email} — Order #{order_id or 'N/A'} — {dt}"
+
+        stamped_io = stamp_pdf(BASE_PDF_PATH, watermark)
+        s3_key = f"private_downloads/{order_id or datetime.datetime.utcnow().timestamp()}_{buyer_email.replace('@','_at_')}.pdf"
+        presigned_url = upload_to_s3(stamped_io, s3_key)
+
+        email_subject = f"Your purchase: {product_title}"
+        email_body = f"Thanks for your purchase!\n\nYou can download your personalized PDF here (available for {PRESIGNED_EXPIRES//3600} hours):\n{presigned_url}\n\nNote: This copy is for personal use only and contains your purchase info."
+        send_email(buyer_email, email_subject, email_body)
+
+        return jsonify({"status": "ok", "download_url": presigned_url}), 200
+
+    except Exception as e:
+        print("Webhook error:", e)
+        return jsonify({"error": str(e)}), 500
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+Add app.py – watermark service
